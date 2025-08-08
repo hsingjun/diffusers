@@ -40,7 +40,8 @@ from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+#from transformers import CLIPTextModel, CLIPTokenizer
+import torch.nn as nn
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
@@ -51,6 +52,8 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+from pretrained_encoder.inference import speciesModel
+import yaml
 
 if is_wandb_available():
     import wandb
@@ -432,8 +435,21 @@ def parse_args():
 
 
 DATASET_NAME_MAPPING = {
-    "lambdalabs/naruto-blip-captions": ("image", "text"),
+    "magic2life/birds_9": ("image", "text"),
+    #"lambdalabs/naruto-blip-captions": ("image", "text"),
 }
+
+class SuperNet(torch.nn.ModuleDict):
+    def __init__(self,  text_encoder: nn.Module):
+        super().__init__()
+        self.text_encoder = text_encoder
+
+    def forward(self, unet, input_ids,  noisy_model_input, timesteps, return_dict=False):
+        encoder_hidden_states = self.text_encoder(input_ids)[0]
+        return unet(
+            noisy_model_input, timesteps, encoder_hidden_states, return_dict=return_dict
+        )[0]
+
 
 
 def main():
@@ -490,12 +506,21 @@ def main():
             ).repo_id
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    """
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
+    """
+    ## replace above TextEncoder with bird encoder
+    with open('./pretrained_encoder/config.yml', 'rb') as f:
+        config = yaml.safe_load(f)
+
+    text_encoder = speciesModel(config['max_tokens'], config['embeddings'], config['species_classes'], config['vocabulary'])##
+    tokenizer = text_encoder.tokenizer
+
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
     )
@@ -505,7 +530,7 @@ def main():
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    #text_encoder.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -525,8 +550,8 @@ def main():
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-
+    #text_encoder.to(accelerator.device, dtype=weight_dtype)
+    
     # Add adapter and make sure the trainable params are in float32.
     unet.add_adapter(unet_lora_config)
     if args.mixed_precision == "fp16":
@@ -644,10 +669,14 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+        """
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
+        """
+        inputs = tokenizer.encode(captions)
+        return torch.tensor(np.array(inputs['input_ids']), dtype=torch.int64 ).to('cuda')
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
@@ -715,6 +744,7 @@ def main():
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
+    supernet = SuperNet( text_encoder)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -809,7 +839,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                #encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -824,7 +854,9 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                
+                model_pred = supernet.forward(unet, batch["input_ids"], noisy_latents, timesteps, return_dict=False)#changed 3/28,
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
