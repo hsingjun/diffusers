@@ -157,64 +157,82 @@ class EmbeddingFromPretrained(nn.Module):
 
 
 class DenseNetwork(pl.LightningModule): #nn.Module
+    """
+    A simple dense network with residual connections.
+    """
+
     def __init__(self,
-                 sizes,
-                 num_classes,
-                 activation_function=F.relu,
+                 hidden_dims= [768, 512],
+                 embedding_dim=1024, #prot protein embedding size
+                 dropout=0.2,
+                 num_classes=10,
+                 #activation_function=F.relu,
                  sigmoid_output=False):
 
         super(DenseNetwork, self).__init__()
 
-        self.sizes = list(sizes)
-        self.activation_function = activation_function
-        self.sigmoid_output = sigmoid_output
-
-        if self.sizes[-1] != 1 and self.sigmoid_output:## output prediction; otherwise, only build last hidden layer
-            self.sizes.append(1)
-
-        self.input_size = self.sizes[0]
-        self.output_size = self.sizes[-1]
-        print("DenseNetwork input_size:", self.input_size, "output_size:", self.output_size )
-        self.dropout = nn.Dropout(0.2)
-
-        self.fc_1 = nn.Linear(in_features=self.sizes[0], out_features=self.sizes[1])
-
-        if len(self.sizes) > 3:
-            self.fc_2 = nn.Linear(in_features=self.sizes[1], out_features=self.sizes[2])
-
-        if len(self.sizes) > 4:
-            self.fc_3 = nn.Linear(in_features=self.sizes[2], out_features=self.sizes[3])
-
-        if len(self.sizes) > 5:
-            self.fc_4 = nn.Linear(in_features=self.sizes[3], out_features=self.sizes[4])
-
-        self.fc_last = nn.Linear(in_features=self.sizes[-2], out_features=self.sizes[-1])
+        #build deep average network layers
+        self.hidden_dims = hidden_dims
+        self.embedding_dim = embedding_dim
+        self.dropout = dropout
+        self.num_classes = num_classes
         
-        self.clf_head = nn.Linear(self.sizes[-1], num_classes)
+        self.deep_layers = nn.ModuleList()
+        self.residual_layers = nn.ModuleList()
 
-    def forward(self, x):
-        x = x.to(torch.bfloat16) # for supportring bfloat16
-        x = self.fc_1(x)
-        x = self.activation_function(x)
-        
-        if len(self.sizes) > 3:
-            x = self.fc_2(x)
-            x = self.activation_function(x)
+        #rebuild layers with residual connections
+        input_dim = embedding_dim # embedding size
+        for i , hidden_dim in enumerate(hidden_dims):
+            layer_block = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout)
+            )
+            self.deep_layers.append(layer_block)
+
+            #residual path
+            if input_dim==hidden_dim:
+                residual_layer = nn.Identity()
+            else:
+                residual_layer = nn.Linear(input_dim, hidden_dim)
+            self.residual_layers.append(residual_layer)
+
+            input_dim = hidden_dim
+
+        #Classifier head
+        self.clf_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim//2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim//2, num_classes) 
+        )
+
+    def forward(self, embeddings, attention_mask=None):
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(-1).float() # add a dimension for attention mask
+            embeddings = embeddings * attention_mask
             
-        if len(self.sizes) > 4:
-            x = self.fc_3(x)
-            x = self.activation_function(x)
-            
-        if len(self.sizes) > 5:
-            x = self.fc_4(x)
-            x = self.activation_function(x)
-        
-        x = self.fc_last(x)
-        last_hidden_state = x 
-        #y = torch.sigmoid(last_hidden_state)
-        outs = self.clf_head(self.activation_function(x))
-        
-        return outs, last_hidden_state
+            #average pooling with proper normalization
+            seq_lengths = attention_mask.sum(dim=1, keepdim=True)
+            averaged_embeddings = embeddings.sum(dim=1) / seq_lengths.clamp(min=1.0) # avoid division by zero
+        else:
+            # Fix: Ensure averaged_embeddings has shape [batch_size, embedding_dim]
+            if len(embeddings.shape) == 3:  # If input is [batch_size, seq_len, embedding_dim]
+                averaged_embeddings = embeddings.mean(dim=1)
+            else:  # If input is [batch_size, embedding_dim]
+                averaged_embeddings = embeddings
+
+        x = averaged_embeddings
+        for deep_layer, residual_layer in zip(self.deep_layers, self.residual_layers):
+            residual = residual_layer(x)
+            x = deep_layer(x) + residual # add residual connection
+
+        #Classification
+        logits = self.clf_head(x)
+
+        return logits, x
+
 
 class DAN(pl.LightningModule):
     def __init__(self,
