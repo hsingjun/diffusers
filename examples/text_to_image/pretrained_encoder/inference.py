@@ -54,15 +54,19 @@ class speciesModel(pl.LightningModule):
                             num_classes = len(self.species_id) #358
         )
         
+        print(f"<><><><> created DAN model with num_classes {len(self.species_id)} and DAN hidden layer [768, 256, 128] ")
+
         #self.model = DAN.load_from_checkpoint('./logs/ckpts/epoch=5-step=13125.ckpt', 
         #                                      embedding_layer=embedding_layer,
         #)
 
         ## run species image training
+        model_path = '/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts_dan_w_residual/last.ckpt'
         #load retrained encoder model using grouped proteins
         #self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder/logs/ckpts/epoch=5-step=13125.ckpt')
-        self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts/last.ckpt')
-        print('loaded model')
+        #self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts_dan_no_residual/last.ckpt') # comment off 08/10/25
+        self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts_dan_w_residual/last.ckpt') # 08/10/25
+        print(f"<><><><> Loaded pretrained model {model_path}")
 
     def load_model(self, ckpt_path):
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)

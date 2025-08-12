@@ -162,8 +162,8 @@ class DenseNetwork(pl.LightningModule): #nn.Module
     """
 
     def __init__(self,
-                 hidden_dims= [768, 512],
-                 embedding_dim=1024, #prot protein embedding size
+                 hidden_dims= [768, 256, 128], # default hidden layer sizes
+                 #embedding_dim=1024, #prot protein embedding size
                  dropout=0.2,
                  num_classes=10,
                  #activation_function=F.relu,
@@ -173,7 +173,7 @@ class DenseNetwork(pl.LightningModule): #nn.Module
 
         #build deep average network layers
         self.hidden_dims = hidden_dims
-        self.embedding_dim = embedding_dim
+        #self.embedding_dim = embedding_dim
         self.dropout = dropout
         self.num_classes = num_classes
         
@@ -181,8 +181,8 @@ class DenseNetwork(pl.LightningModule): #nn.Module
         self.residual_layers = nn.ModuleList()
 
         #rebuild layers with residual connections
-        input_dim = embedding_dim # embedding size
-        for i , hidden_dim in enumerate(hidden_dims):
+        input_dim = hidden_dims[0] # embedding size
+        for i , hidden_dim in enumerate(hidden_dims[1:]):
             layer_block = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
                 nn.BatchNorm1d(hidden_dim),
@@ -239,7 +239,7 @@ class DAN(pl.LightningModule):
                  embedding_layer = None,
                  weight_file_fld = None,
                  embedding_size  = 1024,
-                 sizes= (1024, 768, 512),
+                 sizes= [768, 256, 128], # need to be consistent with the sizes in ~/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/trainer.py:62
                  activation_function = F.relu,
                  num_classes=358, ## 358 bird species
                  sequence_max_length= 6000,
@@ -264,9 +264,10 @@ class DAN(pl.LightningModule):
             raise ValueError('Need embedding layer or weight file')
 
         #self.embedding_layer = self.embedding_layer.to(self.device)
-        self.fc_network = DenseNetwork(sizes=sizes,
+        self.fc_network = DenseNetwork(hidden_dims=sizes,
+                                       dropout=0.2,
                                     num_classes = num_classes,
-                                    activation_function=activation_function,
+                                    #activation_function=activation_function,
                                     sigmoid_output=sigmoid_output).to('cuda')#.to(self.device) ## not working in pl.LightningModule
 
         #2025/05/02: embed each group of proteins separately, take the mean of each group, and then return as individual token's embedding.
