@@ -48,7 +48,7 @@ class speciesModel(pl.LightningModule):
         
         self.tokenizer = ProtTokenizer(voc ,max_length= max_tokens) ## result are same between using tokenizer and tokenizer inside forward function.
 
-        self.model = DAN(sizes=[768, 256, 128], # sync up with ~/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/trainer.py:62
+        self.dan_model = DAN(sizes=[768, 256, 128], # sync up with ~/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/trainer.py:62
                             embedding_layer=embedding_layer,
                             sequence_max_length=max_tokens,
                             num_classes = len(self.species_id) #358
@@ -61,7 +61,9 @@ class speciesModel(pl.LightningModule):
         ## run species image training
         #load retrained encoder model using grouped proteins
         #self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder/logs/ckpts/epoch=5-step=13125.ckpt')
-        self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts/last.ckpt')
+        #self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts/last.ckpt') # comment off on 10/15/2025
+
+        self.load_model('/home/jun/work/species_genAI/finetune/pretrain_species_encoder_susbsystems/logs/ckpts_deepset/last.ckpt') # new model on 10/15/2025
         print('loaded model')
 
     def load_model(self, ckpt_path):
@@ -73,14 +75,14 @@ class speciesModel(pl.LightningModule):
             (k[len(remove_prefix):], v) if k.startswith(remove_prefix) else (k , v) for k, v in checkpoint["state_dict"].items()
                                     ]
                                 )
-        self.model.load_state_dict(state_dict)
+        self.dan_model.load_state_dict(state_dict)
         #epoc = checkpoint['epoch']
         #loss = checkpoint['loss']
         #for param in self.model.parameters():
         #    param.data = param.data.to(torch.bfloat16)
 
-        self.model.to('cuda', dtype=torch.bfloat16)# for supportring bfloat16
-        self.model.eval()
+        self.dan_model.to('cuda', dtype=torch.bfloat16)# for supportring bfloat16
+        self.dan_model.eval()
         
     def forward(self, x, attention_mask=None, **kwargs ):
         """
@@ -90,7 +92,7 @@ class speciesModel(pl.LightningModule):
         """
         if x.device.type == 'cuda': ## for difuserion model only
             x = x.detach().cpu()
-        logits, last_hidden_states = self.model(x)
+        logits, last_hidden_states = self.dan_model(x)
         score = torch.softmax(logits, dim=1)
         probs, preds = torch.max(score,1)
         

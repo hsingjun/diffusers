@@ -10,6 +10,8 @@ from itertools import groupby
 
 from .attentionCompression import AttentionCompression
 from .tokenizer import ProtTokenizer
+#from SetTransformer_77_768 import SetTransformer
+from deepset.proteome_encoder import ProteinDeepSetCLIPHead
 
 seed = 42
 #random.seed(seed)
@@ -193,7 +195,7 @@ class DenseNetwork(pl.LightningModule): #nn.Module
         self.clf_head = nn.Linear(self.sizes[-1], num_classes)
 
     def forward(self, x):
-        x = x.to(torch.bfloat16) # for supportring bfloat16
+        #x = x.to(torch.bfloat16) # for supportring bfloat16
         x = self.fc_1(x)
         x = self.activation_function(x)
         
@@ -214,7 +216,7 @@ class DenseNetwork(pl.LightningModule): #nn.Module
         #y = torch.sigmoid(last_hidden_state)
         outs = self.clf_head(self.activation_function(x))
         
-        return outs, last_hidden_state
+        return outs #, last_hidden_state
 
 class DAN(pl.LightningModule):
     def __init__(self,
@@ -259,37 +261,109 @@ class DAN(pl.LightningModule):
                                                   num_compressed_tokens = 75) # 77 total (consuming 1 + 1 for start + end tokens).
         
         #self.compression_module.to('cuda:0') # pretrain encoder, on 1 gpu.
-        self.compression_module.to('cuda') # train entire model on 2 cuda devices
+        #self.compression_module.to('cuda') # train entire model on 2 cuda devices
+        
+        """
+        self.deepset_model = SetTransformer(
+            input_dim=embedding_size,
+            model_dim=768,
+            num_heads=8,
+            num_inducing=128,
+            num_isab=2,
+            pma_seeds=75,
+            #mlp_output_dim=128,
+            mlp_output_dim=None,
+        ).to('cuda')
+        """
 
-    def sepparate_groups(self, tokens):
+        self.deepset_model = ProteinDeepSetCLIPHead(
+            in_dim=embedding_size,
+            phi_hidden=1024,
+            out_dim=768,
+            num_tokens=77,
+            num_classes=num_classes,
+            p_drop=0.10).to('cuda')
+
+    def sepparate_groups(self, ids, embeds):
         """
         NOT in USE Now.
-        params:
-            tokens: a sinle batch of tokens, which are groups of proteins, separated by [GRP] token.
-        """
-        grp_tokens = []
-        grp_embedding = []
-        sep_tk = 0
-        tokens = tokens.tolist()
-        for k, g in groupby(tokens, lambda t: t == sep_tk):
-            if not k:
-                #grp_tokens.append(torch.tensor(list(g), device='cuda:0', dtype=torch.long)) # convert to tensor, and move to cuda:0
-                grp_tokens.append(list(g))
-
-        for grp in grp_tokens[:-1]:
-            self.embedding_layer.sequence_max_length = len(grp) # update the sequence_max_length to the length of the group ==> workable solution. But still need to fix the index for [PAD]
-            x = self.embedding_layer([grp])                     # , and shape of x is also problematic.
-            x = x[0].mean(dim=1)
-            #grp_embedding.append(self.linear_1(x)[0])
+        ==> in use on 10/14/2025
+        Separates embeddings into groups based on separator token ([GRP], id=0) and averages each group. 
+        The problem is after separation, the number of groups may vary across batches.
         
-        grp_embedding.append(self.compression_module(torch.tensor([grp_tokens[-1]], device='cuda', dtype=torch.bfloat16))) # compress the last group of tokens, which are randomly selected proteins of one species.
-        grp_embedding = [torch.tensor(g, device='cuda', dtype=torch.float) for g in grp_embedding] # convert to tensor, and move to cuda:0
-        return grp_embedding
+        Args:
+            ids: tensor of shape (batch_size, seq_len) containing token ids
+            embeds: tensor of shape (batch_size, seq_len, embed_dim) containing embeddings
+        
+        Returns:
+            List of tensors, each tensor contains averaged embeddings for groups in each batch
+        """
+        batch_size = ids.size(0)
+        all_batch_groups = []
+        grp_token_id = 0  # Assuming 0 is the ID for the separator token [GRP]
+        pad_token_id = 1  # Assuming 1 is the ID for the padding token [PAD]
+        
+        # Process each batch
+        max_groups = 0
+        pad_embedding = None
+        for batch_idx in range(batch_size):
+            batch_ids = ids[batch_idx]
+            batch_embeds = embeds[batch_idx]
+            
+            # Get PAD embedding (first occurrence of pad_token_id)
+            if pad_embedding is None:
+                pad_indices = (batch_ids == pad_token_id).nonzero()
+                if len(pad_indices) > 0:
+                    pad_idx = pad_indices[0]
+                    pad_embedding = batch_embeds[pad_idx].squeeze()
 
-    def _prepare_emb_for_clip(self, tkens):
+            # Find indices where id == 0 (separator token)
+            sep_indices = (batch_ids == grp_token_id).nonzero().flatten()
+            
+            # Add sequence end index for last group
+            indices = torch.cat([sep_indices, torch.tensor([len(batch_ids)]).to(sep_indices.device)])
+            
+            # Split embeddings into groups and average each group
+            groups = []
+            start_idx = 0
+            for end_idx in indices:
+                if end_idx > start_idx:  # Skip empty groups
+                    group_embeds = batch_embeds[start_idx:end_idx] # shape: (group_length, embed_dim)
+                    group_avg = group_embeds.mean(dim=0)  # Average along sequence dimension, torch.Size([1024])
+                    groups.append(group_avg)
+                start_idx = end_idx + 1
+            
+            # Stack all groups for this batch
+            if groups:
+                batch_groups = torch.stack(groups)
+                max_groups = max(max_groups, len(groups))
+                all_batch_groups.append(batch_groups)
+
+        # Second pass: pad each batch to max_groups
+        if pad_embedding is None:
+            pad_embedding = torch.zeros(embeds.size(2)).to(embeds.device)  # Default to zero vector if no PAD found
+            
+        padded_batches = []
+        for batch_groups in all_batch_groups:
+            num_groups = len(batch_groups)
+            if num_groups < max_groups:
+                # Create padding
+                padding = pad_embedding.unsqueeze(0).repeat(max_groups - num_groups, 1)
+                # Concatenate with existing groups
+                padded_batch = torch.cat([batch_groups, padding], dim=0)
+            else:
+                padded_batch = batch_groups
+            padded_batches.append(padded_batch)
+        
+        # Convert list of padded batches to a single tensor
+        padded_batches_tensor = torch.stack(padded_batches)  # shape: (batch_size, max_groups, embed_dim)
+
+        return padded_batches_tensor  # Convert to bfloat16 for consistency
+
+    def _prepare_emb_for_clip(self, ids, embeds):
         """
         params:
-            tkens:  input tokens for individual proteins including group separators, shape: (batch_size, sequence_max_length, embedding_size)
+            tkens/embeds:  input tokens for individual proteins including group separators, shape: (batch_size, sequence_max_length, embedding_size)
         """ 
 
         ## update 2025/03/15, using Attenion-as-compression to transformer output dimention to 77
@@ -320,10 +394,22 @@ class DAN(pl.LightningModule):
         #                                          num_compressed_tokens = 75) # 77 (consuming 1 + 1 for start + end tokens).
         
         #self.compression_module.to('cuda').bfloat16() # pretrain encoder, on 1 gpu.
-        return self.compression_module(torch.tensor(tkens, device='cuda', dtype=torch.bfloat16)) #torch.float  to torch.bfloat16
-        
         #return self.compression_module(tkens)
-    
+
+        # replaced by DeepSetTransformer 10/12/2025
+        #return self.compression_module(torch.tensor(embeds, device='cuda', dtype=torch.bfloat16)) #torch.float  to torch.bfloat16 
+        
+        #out = self.deepset_model(embeds)  # (B, 75, 768)
+        #return out #torch.float32
+
+        #2025/10/14: using DeepSetTransformer to replace Attention-as-compression module
+        #embeds.device = cuda:0
+        
+        grp_embedding = self.sepparate_groups(ids, embeds) # tkens are embedding vectors of proteins, including group separators.
+        #print(f"dtype of grp_embedding: {grp_embedding.dtype}, shape: {grp_embedding.shape}") # torch.float32, shape: torch.Size([10, 20, 1024])
+        out, _ = self.deepset_model(grp_embedding)  # (B, 75, 768)
+        
+        return out.to(torch.bfloat16) # for supportring bfloat16
 
     def forward(self, tokens):
         """
@@ -331,14 +417,15 @@ class DAN(pl.LightningModule):
             tokens: a list of protein ids, from tokennizer
         """
         #comment off the following line on 2025/05/02 <== Undo 2025/05/25
-        x, _ = self.embedding_layer(tokens)
+        x, _ = self.embedding_layer(tokens) # tokens are ids
         if x == None:
             print('None tokens found in DAN:')
 
         #data_for_clip = self._prepare_emb_for_clip(x.to(torch.bfloat16))# for supportring bfloat16, data_for_clip ==> torch.Size([1, 77, 768])
         #data_for_clip = self._prepare_emb_for_clip(x) # commented on 2025/05/02
 
-        data_for_clip = self._prepare_emb_for_clip(x)# changed on 2025/05/02
+        #print(f"dtype of x: {x.dtype}") # dtype of x: torch.float32
+        data_for_clip = self._prepare_emb_for_clip(tokens, x) # changed on 2025/05/02
 
         """
         (Pdb) data_for_clip.shape
@@ -350,13 +437,14 @@ class DAN(pl.LightningModule):
         #comment off the following line on 2025/05/02
         #x = x.mean(dim=1)
         #self.outs, self.last_hidden_state = self.fc_network(x)
-        self.outs, self.last_hidden_state = self.fc_network(data_for_clip.mean(dim=1)) # use data_for_clip as input, to make parameters of attention compression module trainable.
-
-        return self.outs,  data_for_clip #self.last_hidden_state  #x[:, 0]
+        #self.outs, self.last_hidden_state = self.fc_network(data_for_clip.mean(dim=1)) # use data_for_clip as input, to make parameters of attention compression module trainable.
+        self.outs = self.fc_network(data_for_clip.mean(dim=1)) # for supportring bfloat16
+        return self.outs.to(torch.bfloat16),  data_for_clip.to(torch.bfloat16) #self.last_hidden_state  #x[:, 0]
 
 
 if __name__ == '__main__':
-    pretrained_embeddings = EmbeddingFromPretrained(vector_size=1024, embed_dir = '/home/jun/work/species_genAI/example_embed', sequence_max_length=15)
+    demo_max_len = 15
+    pretrained_embeddings = EmbeddingFromPretrained(vector_size=1024, embed_dir = '/home/jun/work/species_genAI/example_embed', sequence_max_length=demo_max_len)
     #pretrained_embeddings = pretrained_embeddings.to('cuda:0')
 
     dan = DAN(
@@ -365,8 +453,8 @@ if __name__ == '__main__':
         num_classes = 10
     )
     
-    tokens = ['tr|A0A8V5HGS3|A0A8V5HGS3_MELUD,tr|A0A8C6N6X0|A0A8C6N6X0_MELUD,tr|A0A8C6JU91|A0A8C6JU91_MELUD,tr|A0A8C6IKR4|A0A8C6IKR4_MELUD','[GRP]'
-              'tr|A0A8C6N6K2|A0A8C6N6K2_MELUD,tr|A0A8C6J5W4|A0A8C6J5W4_MELUD,tr|A0A8C6JF57|A0A8C6JF57_MELUD,tr|A0A8C6JZZ8|A0A8C6JZZ8_MELUD',]
+    tokens = ['tr|A0A8V5HGS3|A0A8V5HGS3_MELUD,tr|A0A8C6N6X0|A0A8C6N6X0_MELUD,[GRP],tr|A0A8C6JU91|A0A8C6JU91_MELUD,[GRP],tr|A0A8C6IKR4|A0A8C6IKR4_MELUD',
+              'tr|A0A8C6N6K2|A0A8C6N6K2_MELUD,[GRP],tr|A0A8C6J5W4|A0A8C6J5W4_MELUD,tr|A0A8C6JF57|A0A8C6JF57_MELUD,tr|A0A8C6JZZ8|A0A8C6JZZ8_MELUD',]
     #tokens = ['tr|A0A7L3F1E2|A0A7L3F1E2_9GRUI,tr|A0A7L3FWF2|A0A7L3FWF2_9GRUI,tr|A0A7L3FE22|A0A7L3FE22_9GRUI']
     voc = []
     with open('./example_bird_protein_vocabulary.txt', 'r') as f:
@@ -374,7 +462,7 @@ if __name__ == '__main__':
             aline = line.strip().split(',')
             voc.append(aline[1])
     
-    tokenizer = ProtTokenizer(voc ,max_length=10) ## result are same between using tokenizer and tokenizer inside forward function.
+    tokenizer = ProtTokenizer(voc ,max_length= demo_max_len) ## result are same between using tokenizer and tokenizer inside forward function.
     tokens = tokenizer.encode(tokens)
     #print("?????", tokens)
     
