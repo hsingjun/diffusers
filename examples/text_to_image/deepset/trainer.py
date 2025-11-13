@@ -1,6 +1,7 @@
 import torch
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
+import torch.nn as nn
 
 def train_one_epoch(model, loader, optimizer, scaler, device, lr_scheduler=None, max_grad_norm=1.0):
     model.train()

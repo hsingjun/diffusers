@@ -1,4 +1,5 @@
 from torch.utils.data import Dataset, DataLoader
+import torch
 
 class ProteinSetDataset(Dataset):
     """
@@ -27,15 +28,15 @@ def collate_sets(batch):
       mask:  (B, Nmax) boolean
       y:     (B,)
     """
-    import torch
+    
     prots, labels = zip(*batch)
     B = len(prots)
     Nmax = max(p.shape[0] for p in prots)
     D = prots[0].shape[1]
 
-    x = torch.zeros(B, Nmax, D, dtype=prots[0].dtype)
+    x    = torch.zeros(B, Nmax, D, dtype=prots[0].dtype)
     mask = torch.zeros(B, Nmax, dtype=torch.bool)
-    y = torch.tensor(labels, dtype=torch.long)
+    y    = torch.tensor(labels, dtype=torch.long)
 
     for i, p in enumerate(prots):
         n = p.shape[0]
